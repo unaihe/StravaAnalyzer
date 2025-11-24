@@ -1,0 +1,9 @@
+# Archivos de Seguridad y Entorno
+.env                     
+# Archivos Generados por Python y Entorno Virtual
+venv/                    
+__pycache__/             
+*.pyc                    
+
+*.csv
+*.txt
