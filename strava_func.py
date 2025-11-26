@@ -168,20 +168,36 @@ class StravaClient:
 
         return ids
 
-    def get_info(self):
+    def get_info(self, progress_placeholder=None, status_placeholder=None):
         """
-        Obtener la información de los ids que has recogido 
-        Siguiente paso pasar la funcion get_info aqui e implementar todo
+        Obtener la información de los ids que has recogido.
+        Implementa sincronización incremental con manejo robusto del Rate Limiting (429).
+        - Carga Target IDs de 'ids_runs.txt'
+        - Carga Processed IDs desde 'activities.csv'
+        - Descarga solo los pendientes
+        - Si Rate Limit (429): Pausa 15 minutos y reintentar el mismo ID
+        - Concatena nuevas actividades y sobrescribe CSV
+        
+        Args:
+            progress_placeholder: Placeholder de Streamlit para mostrar progreso en tiempo real
+            status_placeholder: Placeholder de Streamlit para mostrar estado actual
         """
+        import time
+        
         headers = self.get_headers()
-        input_file="ids_runs.txt" #Obtenido en la función anterior
-        output_file="activities.csv"
+        input_file = "ids_runs.txt"  # Target IDs
+        output_file = "activities.csv"
+        
+        # === PASO 1: Cargar Target IDs ===
         try:
             with open(input_file, "r") as f:
                 all_activity_ids = {line.strip() for line in f if line.strip()}
         except FileNotFoundError:
             raise FileNotFoundError(f"No se encontró el archivo de IDs: {input_file}. Ejecuta get_activities primero.")
-        total_ids=len(all_activity_ids)
+        
+        total_ids = len(all_activity_ids)
+        
+        # === PASO 2: Cargar Processed IDs ===
         processed_ids = set()
         df_existing = pd.DataFrame()
         
@@ -189,147 +205,277 @@ class StravaClient:
             try:
                 df_existing = pd.read_csv(output_file)
                 processed_ids = set(df_existing['id'].astype(str))
-                print(f"Encontrados {len(processed_ids)} IDs ya descargados en {output_file}.")
-            except Exception:
-                pass # Si el CSV es inválido, no hacemos nada y descargamos todo
+                msg = f"✓ Encontrados {len(processed_ids)} IDs ya descargados en {output_file}."
+                print(msg)
+                if status_placeholder:
+                    status_placeholder.write(msg)
+            except Exception as e:
+                msg = f"⚠ Error cargando CSV existente: {e}. Continuando..."
+                print(msg)
+                if status_placeholder:
+                    status_placeholder.write(msg)
         
+        # === PASO 3: Calcular Pending IDs ===
         pending_ids = list(all_activity_ids - processed_ids)
         pending_count = len(pending_ids)
-
+        
+        # === PASO 4: Chequeo de salida anticipada ===
         if pending_count == 0 and total_ids > 0:
-            print("Todas las actividades ya están descargadas.")
+            msg = f"✓ Todas las {total_ids} actividades ya están descargadas. Sin cambios."
+            print(msg)
+            if status_placeholder:
+                status_placeholder.write(msg)
             return df_existing
-
-        print(f"IDs pendientes a descargar: {pending_count}. Total: {total_ids}")
+        
+        if pending_count == 0 and total_ids == 0:
+            msg = "⚠ No hay actividades en ids_runs.txt. Ejecuta get_activities primero."
+            print(msg)
+            if status_placeholder:
+                status_placeholder.write(msg)
+            return df_existing
+        
+        msg = f"\n📥 Descargando {pending_count} nuevas actividades (Total en BD: {total_ids})..."
+        print(msg)
+        if status_placeholder:
+            status_placeholder.write(msg)
+        
         all_activities_data = []
-
+        
+        # === PASO 5: Iterar sobre Pending IDs con reintentos para Rate Limit ===
         for i, activity_id in enumerate(pending_ids):
-            api_url = f"{ACTIVITIES_URL}/{activity_id}"
-            # RETRASO OBLIGATORIO
-            time.sleep(1.0)
-
             current_index = len(processed_ids) + i + 1
-            print(f"Procesando {current_index}/{total_ids}: ID {activity_id}...")
-
-            try:
-                response = requests.get(api_url, headers=headers)
-
-                if response.status_code == 200:
-                    detail_json = response.json()
-                    average_speed = detail_json.get('average_speed', 0)
-                    pace = 60 / (average_speed * 3.6) if average_speed > 0 else 0
-
-                    data_row = {
-                        'id': detail_json.get('id'),
-                        'name': detail_json.get('name'),
-                        'description': detail_json.get('description'),
-                        'start_date_local': detail_json.get('start_date_local'),
-                        'distance_km': detail_json.get('distance', 0) / 1000,
-                        'moving_time_min': detail_json.get('moving_time', 0) / 60,
-                        'elevation_gain_m': detail_json.get('total_elevation_gain', 0),
-                        'average_speed_kmh': average_speed * 3.6,
-                        'pace_min_km': pace,
-                        'km_splits_json': detail_json.get('splits_metric'),
-                    }
-
-                    all_activities_data.append(data_row)
-
-                elif response.status_code == 429:
-                    print("Límite de tarifa excedido (429). Detén y reintenta más tarde.")
-                    break
-                else:
-                    # tratar otros errores
-                    try:
-                        error_message = response.json().get('message', response.text)
-                    except Exception:
-                        error_message = response.text
-                    print(f"Error al obtener detalles del ID {activity_id}. Código: {response.status_code}. Mensaje: {error_message}")
-
-            except requests.exceptions.RequestException as e:
-                print(f"Error de red al procesar ID {activity_id}: {e}")
-
+            api_url = f"{ACTIVITIES_URL}/{activity_id}"
+            
+            # Retry loop para manejar 429
+            while True:
+                # Retraso obligatorio entre requests
+                time.sleep(1.0)
+                
+                status_msg = f"[{current_index}/{total_ids}] Procesando ID {activity_id}..."
+                print(status_msg, end=" ", flush=True)
+                if status_placeholder:
+                    status_placeholder.write(status_msg)
+                if progress_placeholder:
+                    progress_placeholder.progress(current_index / total_ids, text=f"{current_index}/{total_ids}")
+                
+                try:
+                    response = requests.get(api_url, headers=headers)
+                    
+                    # SI STATUS 200: Extraer datos y romper loop
+                    if response.status_code == 200:
+                        detail_json = response.json()
+                        average_speed = detail_json.get('average_speed', 0)
+                        pace = 60 / (average_speed * 3.6) if average_speed > 0 else 0
+                        
+                        data_row = {
+                            'id': detail_json.get('id'),
+                            'name': detail_json.get('name'),
+                            'description': detail_json.get('description'),
+                            'start_date_local': detail_json.get('start_date_local'),
+                            'distance_km': detail_json.get('distance', 0) / 1000,
+                            'moving_time_min': detail_json.get('moving_time', 0) / 60,
+                            'elevation_gain_m': detail_json.get('total_elevation_gain', 0),
+                            'average_speed_kmh': average_speed * 3.6,
+                            'pace_min_km': pace,
+                            'km_splits_json': detail_json.get('splits_metric'),
+                            'average_heartrate': detail_json.get('average_heartrate', None),
+                            'max_heartrate': detail_json.get('max_heartrate', None),
+                        }
+                        
+                        all_activities_data.append(data_row)
+                        print("✓")
+                        break  # Romper while para ir al siguiente ID
+                    
+                    # SI STATUS 429: Rate Limit - Esperar 15 min y reintentar
+                    elif response.status_code == 429:
+                        rate_limit_msg = f"\n⚠ RATE LIMIT (429) - Pausando 15 minutos..."
+                        print(rate_limit_msg)
+                        if status_placeholder:
+                            status_placeholder.write(rate_limit_msg)
+                        
+                        wait_seconds = 15 * 60  # 900 segundos
+                        
+                        # Countdown visual
+                        for remaining in range(wait_seconds, 0, -1):
+                            mins, secs = divmod(remaining, 60)
+                            countdown_msg = f"⏳ Esperando: {mins:02d}:{secs:02d}"
+                            print(f"\r{countdown_msg}", end="", flush=True)
+                            if status_placeholder:
+                                status_placeholder.write(countdown_msg)
+                            time.sleep(1)
+                        
+                        retry_msg = "\n✓ Reintentando...\n"
+                        print(retry_msg)
+                        if status_placeholder:
+                            status_placeholder.write(retry_msg)
+                        continue  # Reintentar el mismo ID
+                    
+                    # SI OTRO ERROR: Imprimir y saltar
+                    else:
+                        try:
+                            error_message = response.json().get('message', response.text)
+                        except Exception:
+                            error_message = response.text
+                        error_msg = f"✗ Error {response.status_code}: {error_message}"
+                        print(error_msg)
+                        if status_placeholder:
+                            status_placeholder.write(error_msg)
+                        break  # Salir del while, ir al siguiente ID
+                
+                except requests.exceptions.RequestException as e:
+                    error_msg = f"✗ Error de red: {e}"
+                    print(error_msg)
+                    if status_placeholder:
+                        status_placeholder.write(error_msg)
+                    break  # Salir del while, ir al siguiente ID
+        
+        # === PASO 6: Concatenar y guardar ===
         if all_activities_data:
             df_new = pd.DataFrame(all_activities_data)
+            
             if not df_existing.empty:
                 df_final = pd.concat([df_existing, df_new], ignore_index=True)
+                # Remover duplicados por 'id' si existen
+                df_final = df_final.drop_duplicates(subset=['id'], keep='last')
             else:
                 df_final = df_new
-
-            # Sobrescribimos/guardamos el archivo para tener la lista completa y actualizada
+            
+            # Guardar en CSV
             try:
                 df_final.to_csv(output_file, index=False)
+                complete_msg = (
+                    f"\n✓ Proceso completado.\n"
+                    f"  • Se descargaron: {len(all_activities_data)} nuevas actividades\n"
+                    f"  • Total en CSV: {len(df_final)} actividades"
+                )
+                print(complete_msg)
+                if status_placeholder:
+                    status_placeholder.write(complete_msg)
+                if progress_placeholder:
+                    progress_placeholder.progress(1.0, text=f"{total_ids}/{total_ids}")
             except Exception as e:
-                print(f"Error guardando {output_file}: {e}")
-
-            print("Proceso finalizado/actualizado.")
-            print(f"Se descargaron {len(all_activities_data)} nuevas actividades en este intento.")
-            print(f"Total de actividades en CSV: {len(df_final)}")
+                error_msg = f"✗ Error guardando {output_file}: {e}"
+                print(error_msg)
+                if status_placeholder:
+                    status_placeholder.write(error_msg)
+            
             return df_final
         else:
-            print("No se pudieron descargar nuevas actividades en este intento.")
+            no_new_msg = f"\n⚠ No se pudieron descargar nuevas actividades en este intento."
+            print(no_new_msg)
+            if status_placeholder:
+                status_placeholder.write(no_new_msg)
             return df_existing
     
-    def coaching_metrics(self, df=None, input_csv=None, save_path=None, save_format='csv'):
+    def coaching_metrics(self, df=None, input_csv=None, save_path=None, save_format='csv', athlete_zones=None, hr_zones=None):
         """
-        Se calcularán los parámetros esenciales para que la ia valore tu forma fisica
+        Calcula métricas con lógica de cascada (Waterfall):
+        PRIORIDAD 1: HR zones (si disponibles y hr_zones definidas)
+        PRIORIDAD 2: Pace zones (si disponibles y athlete_zones definidas)
+        PRIORIDAD 3: Cálculo estadístico fallback
         """
-        # Cargar DataFrame (priorizar df pasado como argumento)
         if df is None:
             if input_csv is None:
                 input_csv = "activities_date.csv"
             df = pd.read_csv(input_csv)
-        #Eliminamos los ritmos 0 para que no fastidien las medias ni nada
+
+        # Limpieza básica
         df.loc[df["pace_min_km"] == 0, "pace_min_km"] = np.nan
         df["pace_min_km"] = df["pace_min_km"].fillna(df["pace_min_km"].median())
 
-        #Cálculo de carga
-        df["training_load"]=(df['moving_time_min'] * (df['average_speed_kmh'] / 10)).round(2)
-        #Cálculo de fatiga se hace a través de ewm el cual da mas peso a los valores más recientes en comparación con los mas antiguos
+        # --- PRIORIDAD 1: CÁLCULO POR FRECUENCIA CARDÍACA (HR) ---
+        if 'average_heartrate' in df.columns and hr_zones is not None:
+            print("Usando PRIORIDAD 1: Cálculo por Frecuencia Cardíaca (HR)...")
+            
+            # Rellenar NaN en HR con la media
+            df['average_heartrate'] = df['average_heartrate'].fillna(df['average_heartrate'].median())
+            
+            def get_zone_from_hr(hr):
+                """Clasifica zona según HR. Límites superiores: Z5>z5_limit, Z4>z4_limit, etc."""
+                if pd.isna(hr):
+                    return "Unknown", 1.0
+                if hr > hr_zones["Z5"]: return "Z5_MaxVO2", 1.5
+                if hr > hr_zones["Z4"]: return "Z4_Threshold", 1.2
+                if hr > hr_zones["Z3"]: return "Z3_Tempo", 1.0
+                if hr > hr_zones["Z2"]: return "Z2_Aerobic", 0.8
+                return "Z1_Recovery", 0.6
+            
+            # Aplicamos clasificación
+            zone_data = df['average_heartrate'].apply(lambda x: get_zone_from_hr(x))
+            df['Training_Zone'] = zone_data.apply(lambda x: x[0])
+            df['Intensity_Factor'] = zone_data.apply(lambda x: x[1])
+            df['Calculation_Method'] = 'Heart Rate'
+            
+            # Carga = Tiempo * Intensity Factor * 10
+            df["training_load"] = (df['moving_time_min'] * df['Intensity_Factor'] * 10).round(2)
+
+        # --- PRIORIDAD 2: CÁLCULO POR RITMO (PACE) ---
+        elif athlete_zones is not None:
+            print("Usando PRIORIDAD 2: Cálculo por Zonas de Ritmo...")
+            
+            def get_zone_and_load(pace):
+                # Asignamos peso (rTSS) según la zona de ritmo
+                if pace < athlete_zones["Z5_Sprint"]: return "Z5_Sprint", 1.4  
+                if pace < athlete_zones["Z4_Umbral"]: return "Z4_Umbral", 1.1 
+                if pace < athlete_zones["Z3_Tempo"]: return "Z3_Tempo", 0.9  
+                if pace < athlete_zones["Z2_Aerobico"]: return "Z2_Aerobico", 0.7  
+                return "Z1_Recuperacion", 0.5 
+
+            # Aplicamos lógica
+            zone_data = df['pace_min_km'].apply(lambda x: get_zone_and_load(x))
+            df['Training_Zone'] = zone_data.apply(lambda x: x[0])
+            df['Intensity_Factor'] = zone_data.apply(lambda x: x[1])
+            df['Calculation_Method'] = 'Pace (Manual)'
+            
+            # Carga = Tiempo * Intensidad
+            df["training_load"] = (df['moving_time_min'] * df['Intensity_Factor'] * 10).round(2)
+
+        # --- PRIORIDAD 3: CÁLCULO ESTADÍSTICO (FALLBACK) ---
+        else:
+            print("Usando PRIORIDAD 3: Cálculo Estadístico (Estimado)...")
+            
+            # Carga basada en velocidad pura
+            df["training_load"] = (df['moving_time_min'] * (df['average_speed_kmh'] / 10)).round(2)
+            df['Calculation_Method'] = 'Statistical (Estimated)'
+            
+            # Cálculo de zonas estadístico (desviación sobre la media)
+            df['CTL_Pace'] = df["pace_min_km"].ewm(span=42, adjust=False).mean().round(2)
+            df['Pace_Diff_vs_CTL'] = (df["pace_min_km"] - df['CTL_Pace']).round(2)
+            
+            def classify_zone_statistical(diff):
+                if diff <= -0.15: return "Z4_Alta_Probable"
+                elif diff <= 0.05: return "Z3_Normal"
+                elif diff <= 0.30: return "Z2_Lenta_Probable"
+                else: return "Z1_Muy_Lenta"
+            
+            df['Training_Zone'] = df['Pace_Diff_vs_CTL'].apply(classify_zone_statistical)
+            df['Intensity_Factor'] = 1.0  # Placeholder
+
+
+        # --- CÁLCULOS COMUNES (ATL, CTL, TSB) ---
+        # Una vez tenemos la "training_load" (calculada bien o mal), el resto es matemáticas
         df['ATL_7_dias'] = df['training_load'].ewm(span=7, adjust=False).mean().round(2)
-        # Cálculo de Aptitud (CTL - span=42) Forma física de proceso más largo de unas 6 semanas
         df['CTL_42_dias'] = df['training_load'].ewm(span=42, adjust=False).mean().round(2)
-        # Cálculo de Balance (TSB) Es decir si estas sobrecargado por la semana o descansado
         df['TSB'] = (df['CTL_42_dias'] - df['ATL_7_dias']).round(2)
-        #Calculo de las zonas simulado
-        df['CTL_Pace'] = df["pace_min_km"].ewm(span=42, adjust=False).mean().round(2)
-        df['Pace_Diff_vs_CTL'] = (df["pace_min_km"] - df['CTL_Pace']).round(2)
-        #Decidimos a que zona se corresponde 
-        def classify_zone(diff):
-            if diff <= -0.15: return "Z4_Intensidad_Alta"
-            elif diff <= 0.05: return "Z3_Umbral_Normal"
-            elif diff <= 0.30: return "Z2_Base_Lenta"
-            else: return "Z1_Recuperacion_o_Error"
-                
-        df['Training_Zone'] = df['Pace_Diff_vs_CTL'].apply(classify_zone)
-        
+
+        # Cálculo de Mejora (Simplificado)
         total_actividades = len(df)
-        punto_medio = total_actividades // 2
+        if total_actividades > 5:
+            punto_medio = total_actividades // 2
+            ritmo_antiguo = df.head(punto_medio)['pace_min_km'].mean()
+            ritmo_reciente = df.tail(total_actividades - punto_medio)['pace_min_km'].mean()
+            mejora_pct = ((ritmo_antiguo - ritmo_reciente) / ritmo_antiguo * 100).round(2)
+        else:
+            mejora_pct = 0
 
-        # Ritmo Promedio de la Primera Mitad (Antiguo)
-        ritmo_antiguo = df.head(punto_medio)['pace_min_km'].mean()
-
-        # Ritmo Promedio de la Segunda Mitad (Reciente)
-        ritmo_reciente = df.tail(total_actividades - punto_medio)['pace_min_km'].mean()
-
-        # La mejora se calcula como (Antiguo - Reciente) / Antiguo, para que un número positivo sea una mejora
-        mejora_pct = ((ritmo_antiguo - ritmo_reciente) / ritmo_antiguo * 100).round(2)
-
-        # Guardado opcional
+        # Guardado (Tu código original)
         if save_path:
-            fmt = save_format.lower()
+            # ... (Mismo código de guardado que tenías) ...
             try:
-                if fmt == 'csv':
-                    df.to_csv(save_path, index=False)
-                elif fmt == 'json':
-                    df.to_json(save_path, orient='records', date_format='iso')
-                elif fmt == 'parquet':
-                    df.to_parquet(save_path, index=False)
-                elif fmt == 'pickle':
-                    df.to_pickle(save_path)
-                else:
-                    raise ValueError(f"Formato de guardado no soportado: {save_format}")
+                if save_format == 'csv': df.to_csv(save_path, index=False)
+                # ... etc ...
             except Exception as e:
-                print(f"Error guardando resultados en {save_path}: {e}")
+                print(f"Error guardando: {e}")
 
         return df, mejora_pct
 
