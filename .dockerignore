@@ -1,0 +1,22 @@
+# Ignorar carpeta de entorno virtual
+venv/
+.venv/
+
+# Ignorar archivos de git
+.git/
+
+# Ignorar archivos de secretos (IMPORTANTE: no meter claves en la imagen)
+.env
+
+# Ignorar caché de python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Otros archivos generados
+.DS_Store
+*.csv
+*.txt
+
+!requirements.txt
