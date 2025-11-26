@@ -190,21 +190,16 @@ if st.button('Descargar detalles (get_info)'):
         st.error(f'Error descargando detalles: {e}')
 
 st.header('Paso 4: Ver/Filtrar actividades')
-if os.path.exists('activities_date.csv'):
-    df_all = pd.read_csv('activities_date.csv')
-    st.write('Vista previa de `activities_date.csv` (ordenado por fecha)')
-    st.dataframe(df_all.head(200))
-else:
-    st.info('No se ha encontrado `activities_date.csv`. Puedes crearla a partir de `activities.csv` con el botón de abajo.')
 
-if os.path.exists('activities.csv'):
-    if st.button('Ordenar `activities.csv` por fecha (crear `activities_date.csv`)'):
-        try:
-            df_sorted = client.sort_activities_by_date(input_path='activities.csv', output_path='activities_date.csv')
-            st.success(f'Creado `activities_date.csv` con {len(df_sorted)} filas.')
-            st.dataframe(df_sorted.head(200))
-        except Exception as e:
-            st.error(f'Error ordenando CSV: {e}')
+try:
+    df_all = client.get_all_activities_sorted()
+    if not df_all.empty:
+        st.success(f'✓ Cargadas {len(df_all)} actividades desde PostgreSQL (ordenadas por fecha)')
+        st.dataframe(df_all.head(200), use_container_width=True)
+    else:
+        st.info('No hay actividades en la base de datos. Ejecuta "Descargar detalles" primero.')
+except Exception as e:
+    st.error(f'✗ Error cargando actividades de PostgreSQL: {e}')
 
 st.header('Paso 5: Métricas de coaching')
 st.header('Configuración de Pulsaciones (Prioridad Alta)')
@@ -280,7 +275,6 @@ if run:
             df_source = None
 
         df_metrics, mejora = client.coaching_metrics(df=df_source if df_source is not None else None,
-                                                     input_csv=None if df_source is not None else 'activities.csv',
                                                      save_path=save if save else None,
                                                      save_format=save_format,
                                                      athlete_zones=user_zones,

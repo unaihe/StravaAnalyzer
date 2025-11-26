@@ -4,8 +4,59 @@ import os
 import time
 import pandas as pd
 import numpy as np
+from sqlalchemy import create_engine, Column, BigInteger, String, Float, DateTime, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv, set_key, find_dotenv
 load_dotenv()
+
+# Crear base para los modelos ORM
+Base = declarative_base()
+
+
+# ==================== MODELO: Activity ====================
+class Activity(Base):
+    """
+    Modelo ORM para la tabla 'activities' en PostgreSQL.
+    Define el esquema explícito con tipos de datos correctos.
+    """
+    __tablename__ = 'activities'
+    
+    # Primary Key
+    id = Column(BigInteger, primary_key=True)
+    
+    # Información básica
+    name = Column(String(500), nullable=True)
+    description = Column(String(5000), nullable=True)
+    
+    # Fecha y hora (indexada para ordenamiento rápido)
+    start_date_local = Column(DateTime, index=True, nullable=True)
+    
+    # Distancia y tiempo
+    distance_km = Column(Float, nullable=True)
+    moving_time_min = Column(Float, nullable=True)
+    elevation_gain_m = Column(Float, nullable=True)
+    
+    # Velocidad y ritmo
+    average_speed_kmh = Column(Float, nullable=True)
+    pace_min_km = Column(Float, nullable=True)
+    
+    # Datos de pulso (Heart Rate)
+    average_heartrate = Column(Float, nullable=True)
+    max_heartrate = Column(Float, nullable=True)
+    
+    # Splits por kilómetro (JSONB en PostgreSQL)
+    km_splits_json = Column(JSON, nullable=True)
+    
+    # Métricas de coaching
+    training_load = Column(Float, nullable=True)
+    intensity_factor = Column(Float, nullable=True)
+    training_zone = Column(String(10), nullable=True)
+    calculation_method = Column(String(50), nullable=True)  # 'Heart Rate', 'Pace', 'Statistical'
+    
+    def __repr__(self):
+        return f"<Activity(id={self.id}, name='{self.name}', date={self.start_date_local})>"
+
 
 ACTIVITIES_URL="https://www.strava.com/api/v3/athlete/activities"
 TOKEN_URL = "https://www.strava.com/oauth/token"
@@ -18,6 +69,17 @@ class StravaClient:
         self.CLIENT_SECRET = os.environ.get('STRAVA_CLIENT_SECRET')
         self.REFRESH_TOKEN = os.environ.get('STRAVA_REFRESH_TOKEN')
         self.ACCESS_TOKEN = None
+        
+        db_url = os.environ.get('DATABASE_URL')
+        if not db_url:
+            db_url = "postgresql+psycopg2://strava_user:strava_pass@localhost:5432/strava_db"
+        self.engine = create_engine(db_url)
+        
+        # Crear las tablas automáticamente al inicializar el cliente
+        Base.metadata.create_all(self.engine)
+        
+        # Crear session factory
+        self.Session = sessionmaker(bind=self.engine)
 
         
     def get_authorization_url(self):
@@ -201,19 +263,26 @@ class StravaClient:
         processed_ids = set()
         df_existing = pd.DataFrame()
         
-        if os.path.exists(output_file):
-            try:
-                df_existing = pd.read_csv(output_file)
-                processed_ids = set(df_existing['id'].astype(str))
-                msg = f"✓ Encontrados {len(processed_ids)} IDs ya descargados en {output_file}."
-                print(msg)
-                if status_placeholder:
-                    status_placeholder.write(msg)
-            except Exception as e:
-                msg = f"⚠ Error cargando CSV existente: {e}. Continuando..."
-                print(msg)
-                if status_placeholder:
-                    status_placeholder.write(msg)
+        try:
+            # En vez de pd.read_csv('activities.csv'), leemos de SQL
+            df_existing = pd.read_sql("SELECT * FROM activities", self.engine)
+            processed_ids = set(df_existing['id'].astype(str))
+        except Exception:
+            # Si la tabla no existe en Postgres, no pasa nada, empezamos de cero
+            pass
+        
+        try:
+            df_existing = pd.read_csv(output_file)
+            processed_ids = set(df_existing['id'].astype(str))
+            msg = f"✓ Encontrados {len(processed_ids)} IDs ya descargados en {output_file}."
+            print(msg)
+            if status_placeholder:
+                status_placeholder.write(msg)
+        except Exception as e:
+            msg = f"⚠ Error cargando CSV existente: {e}. Continuando..."
+            print(msg)
+            if status_placeholder:
+                status_placeholder.write(msg)
         
         # === PASO 3: Calcular Pending IDs ===
         pending_ids = list(all_activity_ids - processed_ids)
@@ -234,7 +303,7 @@ class StravaClient:
                 status_placeholder.write(msg)
             return df_existing
         
-        msg = f"\n📥 Descargando {pending_count} nuevas actividades (Total en BD: {total_ids})..."
+        msg = f"\nDescargando {pending_count} nuevas actividades (Total en BD: {total_ids})..."
         print(msg)
         if status_placeholder:
             status_placeholder.write(msg)
@@ -333,51 +402,66 @@ class StravaClient:
         if all_activities_data:
             df_new = pd.DataFrame(all_activities_data)
             
-            if not df_existing.empty:
-                df_final = pd.concat([df_existing, df_new], ignore_index=True)
-                # Remover duplicados por 'id' si existen
-                df_final = df_final.drop_duplicates(subset=['id'], keep='last')
-            else:
-                df_final = df_new
-            
-            # Guardar en CSV
-            try:
-                df_final.to_csv(output_file, index=False)
-                complete_msg = (
-                    f"\n✓ Proceso completado.\n"
-                    f"  • Se descargaron: {len(all_activities_data)} nuevas actividades\n"
-                    f"  • Total en CSV: {len(df_final)} actividades"
+            # Manejo de JSON: SQLAlchemy Column(JSON) puede manejar tanto dicts como strings
+            # Pero para PostgreSQL JSONB, es mejor mantener como dict
+            # Solo convertir a JSON string si es necesario
+            if 'km_splits_json' in df_new.columns:
+                # Asegurar que es JSON (puede venir como dict o list)
+                # No convertir a string: SQLAlchemy se encarga
+                df_new['km_splits_json'] = df_new['km_splits_json'].apply(
+                    lambda x: x if isinstance(x, (dict, list, type(None))) else json.loads(x) if isinstance(x, str) else None
                 )
-                print(complete_msg)
-                if status_placeholder:
-                    status_placeholder.write(complete_msg)
-                if progress_placeholder:
-                    progress_placeholder.progress(1.0, text=f"{total_ids}/{total_ids}")
-            except Exception as e:
-                error_msg = f"✗ Error guardando {output_file}: {e}"
-                print(error_msg)
-                if status_placeholder:
-                    status_placeholder.write(error_msg)
             
-            return df_final
-        else:
-            no_new_msg = f"\n⚠ No se pudieron descargar nuevas actividades en este intento."
-            print(no_new_msg)
-            if status_placeholder:
-                status_placeholder.write(no_new_msg)
-            return df_existing
+            # Guardar en PostgreSQL
+            try:
+                df_new.to_sql('activities', self.engine, if_exists='append', index=False, dtype={
+                    'id': BigInteger,
+                    'average_heartrate': Float,
+                    'max_heartrate': Float,
+                    'km_splits_json': JSON,
+                })
+                print(f"✓ {len(df_new)} actividades guardadas en PostgreSQL")
+            except Exception as e:
+                print(f"⚠ Error guardando en PostgreSQL: {e}. Intentando modo compatibilidad...")
+                # Fallback: guardar a CSV como respaldo
+                try:
+                    df_new.to_csv('activities_backup.csv', index=False, mode='a', header=False)
+                    print(f"✓ Datos guardados en backup CSV: activities_backup.csv")
+                except Exception as csv_error:
+                    print(f"✗ Error en backup: {csv_error}")
+            
+            df_result = pd.concat([df_existing, df_new], ignore_index=True) if not df_existing.empty else df_new
+            return df_result
+        
+        return df_existing
     
-    def coaching_metrics(self, df=None, input_csv=None, save_path=None, save_format='csv', athlete_zones=None, hr_zones=None):
+    def coaching_metrics(self, df=None, save_path=None, save_format='csv', athlete_zones=None, hr_zones=None):
         """
         Calcula métricas con lógica de cascada (Waterfall):
         PRIORIDAD 1: HR zones (si disponibles y hr_zones definidas)
         PRIORIDAD 2: Pace zones (si disponibles y athlete_zones definidas)
         PRIORIDAD 3: Cálculo estadístico fallback
+        
+        Lee directamente de PostgreSQL si df no se proporciona.
         """
         if df is None:
-            if input_csv is None:
-                input_csv = "activities_date.csv"
-            df = pd.read_csv(input_csv)
+            # Cargar directamente de PostgreSQL, ordenado por fecha
+            try:
+                df = pd.read_sql(
+                    "SELECT * FROM activities ORDER BY start_date_local ASC",
+                    self.engine
+                )
+                print(f"✓ Cargadas {len(df)} actividades desde PostgreSQL")
+            except Exception as e:
+                print(f"✗ Error cargando de PostgreSQL: {e}")
+                raise
+            
+            # Convertir JSON si es necesario
+            if 'km_splits_json' in df.columns:
+                df['km_splits_json'] = df['km_splits_json'].apply(
+                    lambda x: x if isinstance(x, (dict, list, type(None))) 
+                    else json.loads(x) if isinstance(x, str) else None
+                )
 
         # Limpieza básica
         df.loc[df["pace_min_km"] == 0, "pace_min_km"] = np.nan
@@ -479,38 +563,33 @@ class StravaClient:
 
         return df, mejora_pct
 
-    def sort_activities_by_date(self, input_path='activities.csv', output_path='activities_date.csv', date_col='start_date_local', ascending=True):
+    def get_all_activities_sorted(self):
         """
-        Lee `input_path` (CSV), ordena por la columna de fecha `date_col` y guarda en `output_path`.
-
-        Devuelve el DataFrame ordenado.
+        Obtiene todas las actividades de PostgreSQL, ordenadas por fecha.
+        
+        No guarda nada en disco; la BD es la fuente de verdad.
+        
+        Returns:
+            pd.DataFrame: Actividades ordenadas por start_date_local (ASC)
         """
-        if not os.path.exists(input_path):
-            raise FileNotFoundError(f"Archivo no encontrado: {input_path}")
-
         try:
-            df = pd.read_csv(input_path)
+            df = pd.read_sql(
+                "SELECT * FROM activities ORDER BY start_date_local ASC",
+                self.engine
+            )
+            print(f"✓ Cargadas {len(df)} actividades desde PostgreSQL (ordenadas por fecha)")
+            
+            # Convertir JSON si es necesario
+            if 'km_splits_json' in df.columns:
+                df['km_splits_json'] = df['km_splits_json'].apply(
+                    lambda x: x if isinstance(x, (dict, list, type(None))) 
+                    else json.loads(x) if isinstance(x, str) else None
+                )
+            
+            return df
         except Exception as e:
-            raise RuntimeError(f"Error leyendo {input_path}: {e}")
-
-        if date_col not in df.columns:
-            raise KeyError(f"Columna de fecha '{date_col}' no encontrada en {input_path}")
-
-        # Convertir a datetime y ordenar
-        try:
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        except Exception:
-            # si falla la conversión, dejar las fechas como están; filas con NaT se irán al final
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-
-        df_sorted = df.sort_values(by=date_col, ascending=ascending).reset_index(drop=True)
-
-        try:
-            df_sorted.to_csv(output_path, index=False)
-        except Exception as e:
-            raise RuntimeError(f"Error guardando {output_path}: {e}")
-
-        return df_sorted
+            print(f"✗ Error cargando actividades: {e}")
+            raise
 
 
        

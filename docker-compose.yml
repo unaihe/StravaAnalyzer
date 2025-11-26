@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # 1. Tu App (Python/Streamlit)
+  strava-app:
+    build: .
+    container_name: strava_app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app  # Sincroniza tu código en vivo
+    env_file:
+      - .env
+    # AQUÍ ESTÁ LA CLAVE DEL NETWORKING:
+    environment:
+      # Le decimos a Python que la base de datos está en el host llamado "db"
+      - DATABASE_URL=postgresql+psycopg2://strava_user:strava_pass@db:5432/strava_db
+    depends_on:
+      - db
+
+  # 2. La Base de Datos (PostgreSQL)
+  db:
+    image: postgres:15-alpine
+    container_name: strava_postgres
+    environment:
+      - POSTGRES_USER=strava_user
+      - POSTGRES_PASSWORD=strava_pass
+      - POSTGRES_DB=strava_db
+    ports:
+      - "5432:5432" # Para que tú puedas entrar desde fuera (DBeaver)
+    # AQUÍ ESTÁ LA CLAVE DE LA PERSISTENCIA:
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+# Definición del volumen global
+volumes:
+  postgres_data:

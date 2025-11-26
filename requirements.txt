@@ -674,3 +674,5 @@ zope.deprecation==6.0
 zope.event==6.0
 zope.interface==6.4
 zstandard==0.23.0.dev0
+psycopg2-binary
+sqlalchemy
